@@ -1,257 +1,228 @@
 /**
  * Kaiwa Cloudflare Worker
- * Handles /transcribe and /analyze — API key never leaves this worker.
+ * POST /transcribe  — multipart/form-data with "file"
+ * POST /analyze     — JSON body
  *
- * Routes:
- *   POST /transcribe   multipart/form-data with "file" field
- *   POST /analyze      JSON body
- *
- * Both stream SSE back to the browser:
- *   data: {"ping":true}          — keepalive (ignore)
- *   data: {"done":true, ...}     — success
- *   data: {"error":"..."}        — failure
+ * Both stream SSE back to the browser.
+ * API key never leaves this worker.
  */
 
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
-
-const JSON_HEADERS = {
-  "Content-Type": "application/json",
-  ...CORS_HEADERS,
-};
-
-const SSE_HEADERS = {
-  "Content-Type": "text/event-stream",
-  "Cache-Control": "no-cache",
-  "X-Accel-Buffering": "no",
-  ...CORS_HEADERS,
-};
-
-const MAX_BYTES = 24 * 1024 * 1024; // 24MB — Whisper's actual limit, no Netlify cap here
+const ALLOWED_ORIGIN = "https://kaiwa-f53.pages.dev";
+const MAX_BYTES = 24 * 1024 * 1024;
 
 const ALLOWED_TYPES = new Set([
-  "audio/mpeg", "audio/mp3", "audio/mp4", "audio/m4a", "audio/x-m4a",
-  "audio/wav", "audio/wave", "audio/ogg", "audio/webm", "audio/flac",
-  "video/mp4", "video/webm", "video/quicktime",
-  "application/octet-stream",
+  "audio/mpeg","audio/mp3","audio/mp4","audio/m4a","audio/x-m4a",
+  "audio/wav","audio/wave","audio/ogg","audio/webm","audio/flac",
+  "video/mp4","video/webm","video/quicktime","application/octet-stream",
 ]);
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-function jsonError(msg, status = 500) {
-  return new Response(JSON.stringify({ error: msg }), { status, headers: JSON_HEADERS });
+// ── CORS ──────────────────────────────────────────────────────────────────────
+function corsHeaders(request) {
+  const origin = request?.headers?.get("origin") || "";
+  const ok = origin === ALLOWED_ORIGIN
+    || origin.endsWith(".pages.dev")
+    || origin.endsWith(".workers.dev")
+    || origin.startsWith("http://localhost");
+  return {
+    "Access-Control-Allow-Origin": ok ? origin : ALLOWED_ORIGIN,
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Vary": "Origin",
+  };
 }
 
-function sseStream(fn) {
+function jsonErr(msg, status, req) {
+  return new Response(JSON.stringify({ error: msg }), {
+    status,
+    headers: { "Content-Type": "application/json", ...corsHeaders(req) },
+  });
+}
+
+// ── SSE stream factory ────────────────────────────────────────────────────────
+// Cloudflare Workers keep a TransformStream open for as long as the writer
+// is not closed — no wall-clock kill during streaming.
+function makeStream(req) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const enc = new TextEncoder();
-
   const send = async (obj) => {
     try { await writer.write(enc.encode("data: " + JSON.stringify(obj) + "\n\n")); }
     catch (_) {}
   };
-
-  const close = async () => {
-    try { await writer.close(); } catch (_) {}
-  };
-
-  // Run handler in background — Cloudflare Workers keep the response stream
-  // alive as long as there's an active TransformStream, no wall-clock kill.
-  fn(send, close);
-
-  return new Response(readable, { headers: SSE_HEADERS });
+  const close = async () => { try { await writer.close(); } catch (_) {} };
+  const response = new Response(readable, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
+      ...corsHeaders(req),
+    },
+  });
+  return { send, close, response };
 }
 
-function heartbeat(send, intervalMs = 5000) {
-  // Returns a cancel function. Sends pings so the browser knows we're alive.
-  const id = setInterval(() => send({ ping: true }), intervalMs);
+function startHeartbeat(send, ms = 4000) {
+  const id = setInterval(() => send({ ping: true }), ms);
   return () => clearInterval(id);
 }
 
 // ── /transcribe ───────────────────────────────────────────────────────────────
+async function handleTranscribe(req, env) {
+  const cl = parseInt(req.headers.get("content-length") || "0", 10);
+  if (cl > MAX_BYTES) return jsonErr(`Chunk too large (${(cl/1048576).toFixed(1)} MB). Max 24 MB.`, 413, req);
 
-async function handleTranscribe(request, env) {
-  const contentLength = parseInt(request.headers.get("content-length") || "0", 10);
-  if (contentLength > MAX_BYTES) {
-    return jsonError(`File too large (${(contentLength / 1048576).toFixed(1)} MB). Max is 24 MB per chunk.`, 413);
-  }
+  let fd;
+  try { fd = await req.formData(); }
+  catch (e) { return jsonErr("Failed to parse upload: " + e.message, 400, req); }
 
-  let formData;
-  try { formData = await request.formData(); }
-  catch (e) { return jsonError("Failed to parse upload: " + e.message, 400); }
+  const file = fd.get("file");
+  if (!file || typeof file === "string") return jsonErr("No audio file received.", 400, req);
 
-  const audioFile = formData.get("file");
-  if (!audioFile || typeof audioFile === "string") {
-    return jsonError("No audio file received.", 400);
-  }
+  const mime = (file.type || "").toLowerCase();
+  if (mime && !ALLOWED_TYPES.has(mime)) return jsonErr(`Unsupported type: ${mime}`, 415, req);
+  if (file.size > MAX_BYTES) return jsonErr(`Chunk too large (${(file.size/1048576).toFixed(1)} MB). Max 24 MB.`, 413, req);
 
-  const mime = (audioFile.type || "").toLowerCase();
-  if (mime && !ALLOWED_TYPES.has(mime)) {
-    return jsonError(`Unsupported file type: ${mime}`, 415);
-  }
+  const { send, close, response } = makeStream(req);
 
-  if (audioFile.size > MAX_BYTES) {
-    return jsonError(`File too large (${(audioFile.size / 1048576).toFixed(1)} MB). Max is 24 MB per chunk.`, 413);
-  }
-
-  return sseStream(async (send, close) => {
-    const stopPing = heartbeat(send, 5000);
+  (async () => {
+    const stopPing = startHeartbeat(send);
     try {
-      const outForm = new FormData();
-      outForm.append("file", audioFile);
-      outForm.append("model", "whisper-1");
-      outForm.append("response_format", "verbose_json");
-      outForm.append("timestamp_granularities[]", "segment");
+      const out = new FormData();
+      out.append("file", file);
+      out.append("model", "whisper-1");
+      out.append("response_format", "verbose_json");
+      out.append("timestamp_granularities[]", "segment");
 
-      // Cloudflare Workers have no wall-clock timeout on fetch() —
-      // this will wait as long as Whisper needs, even for large files.
-      const whisperRes = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
         method: "POST",
         headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
-        body: outForm,
+        body: out,
       });
 
-      const rawText = await whisperRes.text();
-
-      if (!whisperRes.ok) {
-        let errMsg = `Whisper error (${whisperRes.status})`;
-        try { errMsg = JSON.parse(rawText).error?.message || errMsg; } catch {}
-        await send({ error: errMsg });
-        return;
+      const raw = await res.text();
+      if (!res.ok) {
+        let msg = `Whisper error (${res.status})`;
+        try { msg = JSON.parse(raw).error?.message || msg; } catch {}
+        await send({ error: msg }); return;
       }
 
       let result;
-      try { result = JSON.parse(rawText); }
-      catch (e) { await send({ error: "Whisper returned unexpected response: " + rawText.substring(0, 200) }); return; }
+      try { result = JSON.parse(raw); }
+      catch { await send({ error: "Whisper returned unexpected response: " + raw.substring(0,200) }); return; }
 
       await send({ done: true, result });
-
-    } catch (err) {
-      await send({ error: "Transcription failed: " + err.message });
+    } catch (e) {
+      await send({ error: "Transcription failed: " + e.message });
     } finally {
       stopPing();
       await close();
     }
-  });
+  })();
+
+  return response;
 }
 
-// ── /analyze ─────────────────────────────────────────────────────────────────
-
-async function handleAnalyze(request, env) {
+// ── /analyze ──────────────────────────────────────────────────────────────────
+async function handleAnalyze(req, env) {
   let transcript, segments, language, detectedLanguage;
   try {
-    const body = await request.json();
-    transcript      = body.transcript;
-    segments        = body.segments || [];
-    language        = body.language || "id";
-    detectedLanguage = body.detectedLanguage || null;
-  } catch (e) {
-    return jsonError("Invalid request: " + e.message, 400);
-  }
+    const b = await req.json();
+    transcript = b.transcript; segments = b.segments || [];
+    language = b.language || "id"; detectedLanguage = b.detectedLanguage || null;
+  } catch (e) { return jsonErr("Invalid request: " + e.message, 400, req); }
 
-  if (!transcript || !transcript.trim()) {
-    return jsonError("Transcript is empty.", 400);
-  }
+  if (!transcript?.trim()) return jsonErr("Transcript is empty.", 400, req);
 
   const outputLangLabel =
     language === "en"   ? "English" :
     language === "both" ? "Indonesian and English (write every field in BOTH languages separated by a slash, e.g. 'Rapat dimulai / Meeting started')" :
     "Indonesian (Bahasa Indonesia)";
 
-  const sourceLangRaw   = (detectedLanguage || "").trim().toLowerCase();
-  const sourceLang      = sourceLangRaw || "the original language";
-  const sourceLangLabel = sourceLang === "the original language"
-    ? "the original language"
-    : sourceLang.charAt(0).toUpperCase() + sourceLang.slice(1);
+  const srcRaw   = (detectedLanguage || "").trim().toLowerCase();
+  const srcLang  = srcRaw || "the original language";
+  const srcLabel = srcLang === "the original language" ? srcLang
+    : srcLang.charAt(0).toUpperCase() + srcLang.slice(1);
 
-  // Build original-language transcript from Whisper segments — verbatim, no GPT
   const originalTranscript = segments.length > 0
     ? segments.map(s => `[${s.startFormatted}] [Speaker]: ${s.text}`).join("\n")
     : transcript;
 
-  const segmentBlock = segments.length > 0
+  const segBlock = segments.length > 0
     ? segments.map(s => `[${s.startFormatted}] ${s.text}`).join("\n")
     : transcript;
-  const cappedSegments = segmentBlock.length > 12000
-    ? segmentBlock.substring(0, 12000) + "\n[... truncated ...]"
-    : segmentBlock;
+  const capped = segBlock.length > 12000
+    ? segBlock.substring(0, 12000) + "\n[... truncated ...]"
+    : segBlock;
 
   const systemPrompt = `You are a meeting analyst and translator. Analyze this transcript and return a JSON object.
 
-Source language: ${sourceLangLabel}
+Source language: ${srcLabel}
 Output language: ${outputLangLabel}
 
 LANGUAGE RULES — ABSOLUTE, NO EXCEPTIONS:
-- You MUST write ALL output fields in ${outputLangLabel}.
-- This applies to EVERY field: summary points, subPoints, keyPoints, highlights quote, highlights context, chapter titles, chapter summaries, speaker summaries, transcript lines — everything.
-- If output language is Indonesian, write in Indonesian. If English, write in English. If both, write "Indonesian / English" for each field.
-- Do NOT default to English. Do NOT mix languages unless output language explicitly says "both".
+- Write ALL output fields in ${outputLangLabel}. Every field. No exceptions.
+- summary, subPoints, keyPoints, highlights, chapter titles, chapter summaries, speaker summaries, transcript lines — ALL in output language.
+- Do NOT default to English unless output language is English.
+- Do NOT mix languages unless output language explicitly says "both".
 
-CONTENT RULES — sections must be DISTINCT:
-- CHAPTERS: Time blocks by topic. Title = actual topic discussed. No decisions here.
-- KEY POINTS: Only explicit decisions, commitments, action items with WHO + WHAT.
-- HIGHLIGHTS: 2-4 quotes that are surprising or decisive. Translate to output language. Explain why each matters.
-- SUMMARY: Past-tense narrative with specific names/numbers. Do NOT repeat key points verbatim.
-- TRANSCRIPT (translated): Full translation of every utterance in output language. Format: "[M:SS] [Speaker Name]: text"
+CONTENT RULES:
+- CHAPTERS: Time blocks by topic. Title = actual topic. No decisions here.
+- KEY POINTS: Explicit decisions/commitments/action items only. WHO + WHAT.
+- HIGHLIGHTS: 2-4 surprising or decisive quotes. Translate to output language. Explain why each matters.
+- SUMMARY: Past-tense narrative. Specific names/numbers. No repeating key points.
+- TRANSCRIPT: Full translation of every utterance. Format: "[M:SS] [Speaker]: text"
 
-Speaker detection: use real names if mentioned, else Speaker A/B/C. Be consistent across all fields.
-Translation: natural and contextual, never literal. Match the formality level of the original.
+Speaker detection: real names if mentioned, else Speaker A/B/C. Consistent across all fields.
+Translation: natural and contextual. Match formality level.
 
-CRITICAL: Return ONLY valid JSON. No markdown. No code fences. No text outside the JSON object.
+CRITICAL: Return ONLY valid JSON. No markdown. No code fences. Nothing outside the JSON.
 
 {
-  "speakers": [{"id":"speaker_a","label":"Speaker A","name":null,"role":null,"summary":"<in output language>"}],
-  "chapters": [{"title":"<in output language>","timestamp":"0:00 - 2:30","summary":"<in output language>"}],
+  "speakers": [{"id":"speaker_a","label":"Speaker A","name":null,"role":null,"summary":"<output lang>"}],
+  "chapters": [{"title":"<output lang>","timestamp":"0:00 - 2:30","summary":"<output lang>"}],
   "tabs": {
-    "summary": [{"point":"<in output language>","subPoints":["<in output language>"]}],
-    "keyPoints": [{"point":"<WHO> <WHAT> — in output language","subPoints":["<detail>"]}],
-    "highlights": [{"speaker":"Speaker A","quote":"<translated to output language>","context":"<in output language>"}]
+    "summary": [{"point":"<output lang>","subPoints":["<output lang>"]}],
+    "keyPoints": [{"point":"<output lang>","subPoints":["<output lang>"]}],
+    "highlights": [{"speaker":"Speaker A","quote":"<translated>","context":"<output lang>"}]
   },
   "transcripts": {
-    "translated": "[0:00] [Speaker A]: <full translation in output language>\\n[0:05] [Speaker B]: <translation>"
+    "translated": "[0:00] [Speaker A]: <output lang>\\n[0:05] [Speaker B]: <output lang>"
   }
 }`;
 
-  return sseStream(async (send, close) => {
-    const stopPing = heartbeat(send, 5000);
+  const { send, close, response } = makeStream(req);
+
+  (async () => {
+    const stopPing = startHeartbeat(send);
     try {
-      const gptRes = await fetch("https://api.openai.com/v1/chat/completions", {
+      const gpt = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${env.OPENAI_API_KEY}` },
         body: JSON.stringify({
-          model: "gpt-4o",
-          max_tokens: 8192,
-          temperature: 0.1,
-          stream: true,
+          model: "gpt-4o", max_tokens: 8192, temperature: 0.1, stream: true,
           messages: [
             { role: "system", content: systemPrompt },
-            { role: "user", content: `Timestamped transcript to analyze and translate:\n${cappedSegments}` },
+            { role: "user", content: `Timestamped transcript:\n${capped}` },
           ],
         }),
       });
 
-      if (!gptRes.ok) {
-        const errText = await gptRes.text();
-        let errMsg = `OpenAI error (${gptRes.status})`;
-        try { errMsg = JSON.parse(errText).error?.message || errMsg; } catch {}
-        await send({ error: errMsg });
-        return;
+      if (!gpt.ok) {
+        const t = await gpt.text();
+        let msg = `OpenAI error (${gpt.status})`;
+        try { msg = JSON.parse(t).error?.message || msg; } catch {}
+        await send({ error: msg }); return;
       }
 
-      let accumulated = "";
-      let lineBuf = "";
-      const reader = gptRes.body.getReader();
+      let acc = "", lineBuf = "";
+      const reader = gpt.body.getReader();
       const dec = new TextDecoder();
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         lineBuf += dec.decode(value, { stream: true });
-
         let nl;
         while ((nl = lineBuf.indexOf("\n")) !== -1) {
           const line = lineBuf.slice(0, nl).trimEnd();
@@ -259,68 +230,51 @@ CRITICAL: Return ONLY valid JSON. No markdown. No code fences. No text outside t
           if (!line.startsWith("data: ")) continue;
           const raw = line.slice(6).trim();
           if (raw === "[DONE]") continue;
-          let parsed;
-          try { parsed = JSON.parse(raw); } catch { continue; }
-          const token = parsed.choices?.[0]?.delta?.content;
-          if (token) { accumulated += token; await send({ token }); }
+          let p; try { p = JSON.parse(raw); } catch { continue; }
+          const token = p.choices?.[0]?.delta?.content;
+          if (token) { acc += token; await send({ token }); }
         }
       }
 
-      // Strip stray markdown fences
-      const clean = accumulated
-        .replace(/^```json\s*/m, "").replace(/^```\s*/m, "").replace(/\s*```$/m, "").trim();
-
-      // Extract outermost JSON object defensively
-      const jsonStart = clean.indexOf("{");
-      const jsonEnd   = clean.lastIndexOf("}");
-      const jsonStr   = jsonStart !== -1 && jsonEnd !== -1 ? clean.slice(jsonStart, jsonEnd + 1) : clean;
+      const clean = acc.replace(/^```json\s*/m,"").replace(/^```\s*/m,"").replace(/\s*```$/m,"").trim();
+      const s = clean.indexOf("{"), e = clean.lastIndexOf("}");
+      const jsonStr = s !== -1 && e !== -1 ? clean.slice(s, e+1) : clean;
 
       let result;
       try { result = JSON.parse(jsonStr); }
-      catch (e) {
-        await send({ error: "Failed to parse analysis. Try a shorter recording. Raw: " + clean.substring(0, 200) });
-        return;
-      }
+      catch { await send({ error: "Failed to parse analysis. Raw: " + clean.substring(0,200) }); return; }
 
-      // Attach original-language transcript built from Whisper segments
       if (!result.transcripts) result.transcripts = {};
       result.transcripts.translated = result.transcripts.translated || "";
       result.transcripts.original   = originalTranscript;
-      result._meta = { sourceLang: sourceLangLabel, outputLang: language };
+      result._meta = { sourceLang: srcLabel, outputLang: language };
 
       await send({ done: true, result });
-
-    } catch (err) {
-      await send({ error: "Analysis failed: " + err.message });
+    } catch (e) {
+      await send({ error: "Analysis failed: " + e.message });
     } finally {
       stopPing();
       await close();
     }
-  });
+  })();
+
+  return response;
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
-
 export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
+  async fetch(req, env) {
+    const url = new URL(req.url);
 
-    // Handle CORS preflight
-    if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    if (req.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders(req) });
     }
+    if (req.method !== "POST") return jsonErr("Method Not Allowed", 405, req);
+    if (!env.OPENAI_API_KEY)   return jsonErr("OPENAI_API_KEY not configured.", 500, req);
 
-    if (request.method !== "POST") {
-      return jsonError("Method Not Allowed", 405);
-    }
+    if (url.pathname === "/transcribe") return handleTranscribe(req, env);
+    if (url.pathname === "/analyze")    return handleAnalyze(req, env);
 
-    if (!env.OPENAI_API_KEY) {
-      return jsonError("OPENAI_API_KEY secret not configured. Run: wrangler secret put OPENAI_API_KEY", 500);
-    }
-
-    if (url.pathname === "/transcribe") return handleTranscribe(request, env);
-    if (url.pathname === "/analyze")    return handleAnalyze(request, env);
-
-    return jsonError("Not found", 404);
+    return jsonErr("Not found.", 404, req);
   }
 };
