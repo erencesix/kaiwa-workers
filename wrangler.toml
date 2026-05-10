@@ -1,3 +1,10 @@
 name = "kaiwa-worker"
 main = "src/index.js"
 compatibility_date = "2026-05-10"
+
+# KV namespace for storing transcription jobs
+# After deploying, create this with: wrangler kv namespace create KAIWA_KV
+# Then paste the ID you get back into the id field below
+[[kv_namespaces]]
+  binding = "KAIWA_KV"
+  id = "a64765abfd46463e982eebacf8d42fb2"
