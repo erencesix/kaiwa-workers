@@ -1,25 +1,18 @@
 /**
- * Kaiwa Cloudflare Worker — v3
+ * Kaiwa Cloudflare Worker — v4
  *
  * Routes:
- *   POST /transcribe   Upload audio chunk → returns {jobId, status:'processing'} instantly
- *   GET  /transcribe?jobId=xxx  Poll for result → returns {status:'done', result} or {status:'processing'}
- *   POST /analyze      JSON body → streams SSE back (GPT-4o)
+ *   POST /transcribe   Upload audio → starts Whisper in background via ctx.waitUntil
+ *                      Returns {jobId} instantly
+ *   GET  /transcribe?jobId=xxx  Poll for result
+ *   POST /analyze      Streams GPT-4o analysis via SSE
  *
- * How transcription works (no timeout issues):
- *   1. Browser POSTs audio → worker uploads to OpenAI Files API (fast, just a file upload)
- *   2. Worker kicks off a transcription job and returns a jobId immediately
- *   3. Browser polls GET /transcribe?jobId=xxx every 3s
- *   4. Worker checks job status and returns result when ready
- *
- * This means the worker never has to wait for Whisper — it just stores/retrieves
- * state in a KV store (Cloudflare KV, included free).
- *
- * API key lives in Cloudflare secrets — never exposed to the browser.
+ * ctx.waitUntil() keeps the worker alive after the response is sent,
+ * allowing Whisper to finish without any timeout on the response.
  */
 
 const ALLOWED_ORIGIN = "https://kaiwa-f53.pages.dev";
-const MAX_BYTES = 24 * 1024 * 1024; // 24MB — Whisper's actual limit
+const MAX_BYTES = 24 * 1024 * 1024;
 
 const ALLOWED_TYPES = new Set([
   "audio/mpeg","audio/mp3","audio/mp4","audio/m4a","audio/x-m4a",
@@ -53,14 +46,11 @@ function jsonErr(msg, status = 500, req = null) {
   return jsonResp({ error: msg }, status, req);
 }
 
-// ── Unique job ID ─────────────────────────────────────────────────────────────
 function makeId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
 
 // ── POST /transcribe ──────────────────────────────────────────────────────────
-// Receives audio chunk, uploads to OpenAI Files API, starts transcription,
-// stores job in KV, returns jobId immediately (well under 30s CPU limit).
 async function handleTranscribeUpload(req, env, ctx) {
   const cl = parseInt(req.headers.get("content-length") || "0", 10);
   if (cl > MAX_BYTES) return jsonErr(`Chunk too large (${(cl/1048576).toFixed(1)} MB). Max 24 MB.`, 413, req);
@@ -76,86 +66,52 @@ async function handleTranscribeUpload(req, env, ctx) {
   if (mime && !ALLOWED_TYPES.has(mime)) return jsonErr(`Unsupported type: ${mime}`, 415, req);
   if (file.size > MAX_BYTES) return jsonErr(`Chunk too large (${(file.size/1048576).toFixed(1)} MB). Max 24 MB.`, 413, req);
 
-  // Step 1: Upload to OpenAI Files API
-  // This is fast — just a file upload, no transcription yet
-  const uploadForm = new FormData();
-  uploadForm.append("file", file);
-  uploadForm.append("purpose", "assistants"); // required by Files API
-
-  let fileId;
-  try {
-    const uploadRes = await fetch("https://api.openai.com/v1/files", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
-      body: uploadForm,
-    });
-    const uploadData = await uploadRes.json();
-    if (!uploadRes.ok) throw new Error(uploadData.error?.message || `Upload failed (${uploadRes.status})`);
-    fileId = uploadData.id;
-  } catch (e) {
-    return jsonErr("File upload failed: " + e.message, 502, req);
-  }
-
-  // Step 2: Start transcription job using the file ID
-  // We use the standard transcriptions endpoint with the file_id
   const jobId = makeId();
 
-  // Use ctx.waitUntil to run transcription in background AFTER response is sent
-  // This is the correct Cloudflare Workers pattern for background work
+  // Store as processing immediately so polls don't return 404
+  await env.KAIWA_KV.put(`job:${jobId}`, JSON.stringify({ status: "processing" }), { expirationTtl: 3600 });
+
+  // Read file into memory BEFORE sending response — after response is sent
+  // the request body may no longer be readable
+  const fileBuffer = await file.arrayBuffer();
+  const fileName = file.name || "audio.mp3";
+  const fileMime = file.type || "audio/mpeg";
+
+  // Run Whisper in background — ctx.waitUntil keeps worker alive until done
   ctx.waitUntil((async () => {
     try {
-      // Store job as "processing" in KV immediately
-      await env.KAIWA_KV.put(`job:${jobId}`, JSON.stringify({ status: "processing" }), { expirationTtl: 3600 });
+      const form = new FormData();
+      form.append("file", new File([fileBuffer], fileName, { type: fileMime }));
+      form.append("model", "whisper-1");
+      form.append("response_format", "verbose_json");
+      form.append("timestamp_granularities[]", "segment");
 
-      // Download the file we just uploaded (we need to re-upload to transcriptions endpoint)
-      // because OpenAI's transcription API doesn't support file_id directly in whisper-1
-      const fileRes = await fetch(`https://api.openai.com/v1/files/${fileId}/content`, {
-        headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
-      });
-      if (!fileRes.ok) throw new Error(`Failed to retrieve uploaded file (${fileRes.status})`);
-
-      const fileBlob = await fileRes.blob();
-      const filename = file.name || "audio.mp3";
-      const fileMime = file.type || "audio/mpeg";
-
-      // Now transcribe
-      const transcribeForm = new FormData();
-      transcribeForm.append("file", new File([fileBlob], filename, { type: fileMime }));
-      transcribeForm.append("model", "whisper-1");
-      transcribeForm.append("response_format", "verbose_json");
-      transcribeForm.append("timestamp_granularities[]", "segment");
-
-      const transcribeRes = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
         method: "POST",
         headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
-        body: transcribeForm,
+        body: form,
       });
 
-      const raw = await transcribeRes.text();
-      if (!transcribeRes.ok) {
-        let msg = `Whisper error (${transcribeRes.status})`;
+      const raw = await res.text();
+
+      if (!res.ok) {
+        let msg = `Whisper error (${res.status})`;
         try { msg = JSON.parse(raw).error?.message || msg; } catch {}
         await env.KAIWA_KV.put(`job:${jobId}`, JSON.stringify({ status: "error", error: msg }), { expirationTtl: 3600 });
         return;
       }
 
-      const result = JSON.parse(raw);
+      let result;
+      try { result = JSON.parse(raw); }
+      catch { await env.KAIWA_KV.put(`job:${jobId}`, JSON.stringify({ status: "error", error: "Unexpected Whisper response: " + raw.substring(0, 200) }), { expirationTtl: 3600 }); return; }
+
       await env.KAIWA_KV.put(`job:${jobId}`, JSON.stringify({ status: "done", result }), { expirationTtl: 3600 });
 
     } catch (e) {
       await env.KAIWA_KV.put(`job:${jobId}`, JSON.stringify({ status: "error", error: e.message }), { expirationTtl: 3600 });
-    } finally {
-      // Clean up the uploaded file from OpenAI to avoid storage costs
-      try {
-        await fetch(`https://api.openai.com/v1/files/${fileId}`, {
-          method: "DELETE",
-          headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
-        });
-      } catch {}
     }
   })());
 
-  // Return jobId immediately — browser will poll for result
   return jsonResp({ jobId, status: "processing" }, 202, req);
 }
 
@@ -166,14 +122,12 @@ async function handleTranscribePoll(req, env) {
   if (!jobId) return jsonErr("Missing jobId.", 400, req);
 
   const raw = await env.KAIWA_KV.get(`job:${jobId}`);
-  if (!raw) return jsonResp({ status: "processing" }, 200, req); // not ready yet
+  if (!raw) return jsonResp({ status: "processing" }, 200, req);
 
-  const job = JSON.parse(raw);
-  return jsonResp(job, 200, req);
+  return jsonResp(JSON.parse(raw), 200, req);
 }
 
 // ── POST /analyze ─────────────────────────────────────────────────────────────
-// Streams GPT-4o response via SSE using ctx.waitUntil for background streaming
 async function handleAnalyze(req, env, ctx) {
   let transcript, segments, language, detectedLanguage;
   try {
@@ -244,15 +198,12 @@ CRITICAL: Return ONLY valid JSON. No markdown. No code fences. Nothing outside t
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const enc = new TextEncoder();
-
   const send = async (obj) => {
-    try { await writer.write(enc.encode("data: " + JSON.stringify(obj) + "\n\n")); }
-    catch (_) {}
+    try { await writer.write(enc.encode("data: " + JSON.stringify(obj) + "\n\n")); } catch (_) {}
   };
 
   ctx.waitUntil((async () => {
-    // Heartbeat every 5s to keep the browser connection alive
-    const heartbeat = setInterval(() => send({ ping: true }), 5000);
+    const hb = setInterval(() => send({ ping: true }), 5000);
     try {
       const gpt = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
@@ -300,7 +251,7 @@ CRITICAL: Return ONLY valid JSON. No markdown. No code fences. Nothing outside t
 
       let result;
       try { result = JSON.parse(jsonStr); }
-      catch { await send({ error: "Failed to parse analysis. Try a shorter recording. Raw: " + clean.substring(0, 200) }); return; }
+      catch { await send({ error: "Failed to parse analysis. Raw: " + clean.substring(0,200) }); return; }
 
       if (!result.transcripts) result.transcripts = {};
       result.transcripts.translated = result.transcripts.translated || "";
@@ -311,7 +262,7 @@ CRITICAL: Return ONLY valid JSON. No markdown. No code fences. Nothing outside t
     } catch (e) {
       await send({ error: "Analysis failed: " + e.message });
     } finally {
-      clearInterval(heartbeat);
+      clearInterval(hb);
       try { await writer.close(); } catch (_) {}
     }
   })());
@@ -336,7 +287,7 @@ export default {
       return new Response(null, { status: 204, headers: cors(req) });
     }
     if (!env.OPENAI_API_KEY) return jsonErr("OPENAI_API_KEY not configured.", 500, req);
-    if (!env.KAIWA_KV)       return jsonErr("KAIWA_KV binding not configured. Add KV namespace in Cloudflare dashboard.", 500, req);
+    if (!env.KAIWA_KV)       return jsonErr("KAIWA_KV binding not configured.", 500, req);
 
     if (url.pathname === "/transcribe") {
       if (req.method === "GET")  return handleTranscribePoll(req, env);
